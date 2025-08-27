@@ -1,0 +1,608 @@
+---
+title: "Desarrollar y desplegar un modelo de predicción de ictus en R"
+date: "25-08-2025"
+output: html_document
+author: "Clotilde Veliz Veliz"
+---
+
+# Acerca del informe de análisis de datos
+
+Este archivo RMarkdown contiene el informe del análisis de datos realizado para el proyecto de construcción y despliegue de un modelo de predicción de accidentes cerebrovasculares en R. Incluye análisis como exploración de datos, estadísticas descriptivas y el desarrollo de modelos de predicción. El informe final fue completado el 25-08-2025.
+
+**Descripcion de los datos:**
+
+Según la Organización Mundial de la Salud (OMS), el accidente cerebrovascular es la segunda causa principal de muerte a nivel mundial, siendo responsable de aproximadamente el 11% de las muertes totales.
+
+Este conjunto de datos se utiliza para predecir si un paciente tiene probabilidad de sufrir un accidente cerebrovascular en función de parámetros de entrada como el género, la edad, diversas enfermedades y el estado de tabaquismo. Cada fila del conjunto de datos proporciona información relevante sobre el paciente.
+
+
+# Tarea uno: Importación de datos y preprocesamiento de datos
+
+## Cargar datos e instalar paquetes
+
+```{r}
+# Cargar librerías
+
+# install.packages('tidymodels')
+# install.packages('caret')
+# install.packages("themis")
+# install.packages('xgboost')
+# install.packages('randomForest')
+# install.packages('shiny')
+# install.packages("GGally")
+
+library(tidyverse) # Para manipulación de datos y visualización
+library(ggplot2)
+library(scales)  # para formato de porcentaje
+library(dplyr)
+library(corrplot)
+library(vcd)       # assocstats para Cramér's V
+library(caret)
+library(themis)
+library(recipes)
+library(tidymodels)
+library(themis)      # Para step_smote
+library(xgboost)     # Para el modelo XGBoost
+library(randomForest) # Para el modelo Random Forest
+library(shiny)
+library(GGally)
+library(purrr)
+
+# Leer el CSV
+stroke_data <- read.csv("healthcare-dataset-stroke-data.csv")
+
+# Ver las primeras filas
+head(stroke_data)
+```
+
+
+## Describir and explorar los datos
+
+### Identificacion de valores sospechosos
+
+```{r}
+# Número de filas y columnas
+dim(stroke_data)
+
+# Tipos de variables
+str(stroke_data)
+
+#  Definir patrones sospechosos de texto
+patterns <- c("N/A", "NA", "?", "null", "Missing", "")
+
+#  Crear función de chequeo por columna
+check_suspicious <- function(x, varname) {
+  total <- length(x)
+  
+# NA reales
+na_count <- sum(is.na(x))
+  
+# Patrones de texto
+text_count <- 0
+  if (is.character(x) | is.factor(x)) {
+    text_count <- sum(trimws(as.character(x)) %in% patterns, na.rm = TRUE)
+  }
+  
+# Numéricos imposibles (ejemplo BMI <= 0, Age < 0)
+  num_count <- 0
+  if (is.numeric(x)) {
+    if (varname == "bmi") {
+      num_count <- sum(x <= 0, na.rm = TRUE)
+    }
+    if (varname == "age") {
+      num_count <- sum(x < 0, na.rm = TRUE)
+    }
+  }
+  
+  data.frame(
+    Variable = varname,
+    NA_Reales = na_count,
+    Texto_Sospechoso = text_count,
+    Numerico_Ilegal = num_count,
+    Total_Sospechoso = na_count + text_count + num_count,
+    Porcentaje = round(100 * (na_count + text_count + num_count) / total, 2)
+  )
+}
+
+#  Aplicar a todas las variables del dataset
+suspect_table <- do.call(
+  rbind,
+  lapply(names(stroke_data), function(v) check_suspicious(stroke_data[[v]], v))
+)
+
+#  Mostrar tabla
+print(suspect_table)
+
+```
+
+### Tratamiento de valores sospechosos
+
+```{r}
+
+# Extraer los valores únicos de bmi que son texto (no numéricos)
+unique_text_bmi <- unique(stroke_data$bmi[!grepl("^\\d+(\\.\\d+)?$", stroke_data$bmi)])
+
+# Mostrar resultados
+unique_text_bmi
+
+# # Reemplazar "N/A" por NA
+# Crear copia del data frame original
+stroke_data1 <- stroke_data
+
+# Reemplazar "N/A" por NA en bmi
+stroke_data1$bmi[stroke_data1$bmi == "N/A"] <- NA
+
+# Convertir bmi a numérico
+stroke_data1$bmi <- as.numeric(stroke_data1$bmi)
+
+# Convertir todas las columnas de texto a mayúsculas
+char_cols <- sapply(stroke_data1, is.character)  # identificar columnas character
+stroke_data1[ , char_cols] <- lapply(stroke_data1[ , char_cols], toupper)
+head(stroke_data1)
+
+```
+
+### EDA
+
+```{r}
+# Estadísticas y gráficos de variables binarias y categoricas
+
+# Definir las variables binarias y categóricas
+
+binary_vars <- c("hypertension", "heart_disease", "ever_married", "stroke")
+categorical_vars <- c("gender", "work_type", "Residence_type", "smoking_status")
+
+# 1. Gráfico para datos binarios
+# Convertir las variables binarias a factor antes de pivotar
+
+long_bin_data <- stroke_data1 %>%
+  select(all_of(binary_vars)) %>%
+  mutate(across(everything(), as.factor)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "category"
+  )
+
+bin_plot <- ggplot(long_bin_data, aes(x = category)) +
+  geom_bar(fill = "darkgreen", width = 0.5) +
+  labs(
+    title = NULL,
+    y = "Cantidad de pacientes",
+    x = ""
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.y = element_text(size = 8)
+  ) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 4) 
+
+print(bin_plot)
+
+# 2. Gráficos para datos categóricos
+# Las variables ya son de tipo character, por lo que pivotar funcionará
+long_cat_data <- stroke_data1 %>%
+  select(all_of(categorical_vars)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "category"
+  )
+
+# Gráfico 1 (2 variables)
+cat_plot1 <- ggplot(
+  filter(long_cat_data, variable %in% c("gender", "work_type")),
+  aes(x = category)
+) +
+  geom_bar(fill = "steelblue", width = 0.5) +
+  labs(
+    title = NULL,
+    y = "Cantidad de pacientes",
+    x = ""
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8)
+  ) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 2)
+
+print(cat_plot1)
+
+# Gráfico 2 (2 variables)
+cat_plot2 <- ggplot(
+  filter(long_cat_data, variable %in% c("Residence_type", "smoking_status")),
+  aes(x = category)
+) +
+  geom_bar(fill = "steelblue", width = 0.5) +
+  labs(
+    title = NULL,
+    y = "Cantidad de pacientes",
+    x = ""
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 35, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8)
+  ) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 2)
+
+print(cat_plot2)
+
+
+```
+
+```{r}
+# Estadísticas y gráficos de variables numericas
+
+# 1. Identificar variables numéricas
+# Puedes ajustar el tipo de dato, por ejemplo, "factor", si los datos ya están convertidos
+categorical_vars <- stroke_data1 %>%
+  select_if(is.character) %>% # Seleccionamos las variables de tipo 'character' o 'factor'
+  names()
+
+# 2. Iterar sobre cada variable categórica para generar un gráfico
+walk(
+  categorical_vars,
+  ~ {
+    # 3. Crear el mapping dinámicamente
+    p <- ggpairs(
+      data = stroke_data1,
+      mapping = aes(color = .data[[.x]]), # Usa .data[[.x]] para la selección dinámica
+      columns = c("age", "avg_glucose_level", "bmi"),
+      lower = list(continuous = "points"),
+      upper = list(continuous = wrap("cor", size = 3)),
+      diag = list(continuous = wrap("densityDiag"))
+    )
+    
+    # 4. Imprimir el gráfico con un título para identificar la variable
+    print(p + labs(title = paste("Gráfico de Pares por", .x)))
+  }
+)
+```
+```{r}
+# Grafico de bigote
+
+# 1. Seleccionar las variables numéricas
+numeric_vars <- c("age", "avg_glucose_level", "bmi")
+
+# 2. Transformar los datos a un formato "largo"
+# Esto permite que todas las variables numéricas se grafiquen en el mismo gráfico
+long_data <- stroke_data1 %>%
+  pivot_longer(
+    cols = all_of(numeric_vars),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+# 3. Crear el gráfico de caja y bigotes
+ggplot(long_data, aes(x = variable, y = value, fill = variable)) +
+  geom_boxplot() +
+  labs(
+    title = "Gráfico de Caja y Bigotes de Variables Numéricas",
+    x = "Variable",
+    y = "Valor",
+    fill = "Variable"
+  ) +
+  theme_minimal()
+```
+
+### Tabla de contigencia
+```{r}
+
+# Correlación entre variables categóricas (Cramér's V)
+
+categorical_vars <- c("gender", "hypertension", "heart_disease",
+                      "ever_married", "work_type", "Residence_type", "smoking_status")
+
+# Lista para guardar resultados
+cramers_list <- list()
+
+for(i in 1:(length(categorical_vars)-1)){
+  for(j in (i+1):length(categorical_vars)){
+    var1 <- categorical_vars[i]
+    var2 <- categorical_vars[j]
+    tbl <- table(stroke_data1[[var1]], stroke_data1[[var2]])
+    cv <- assocstats(tbl)$cramer
+    cramers_list <- append(cramers_list, list(data.frame(var1=var1, var2=var2, cramerV=cv)))
+  }
+}
+
+# Combinar todos los pares en un solo data frame
+cramers_df <- bind_rows(cramers_list)
+
+# Mostrar toda la tabla completa, ordenada por Cramér's V descendente
+cramers_df <- cramers_df %>% arrange(desc(cramerV))
+print("Tabla completa de Cramér's V entre variables categóricas:")
+print(cramers_df)
+
+# Interpretación rápida
+
+# Para categóricas: Cramér's V > 0.7 indica fuerte asociación
+
+```
+### Analisis de asosiacion con la variable objetivo
+
+```{r}
+# Variables
+
+numeric_vars <- c("age", "avg_glucose_level", "bmi")
+categorical_vars <- c("gender", "hypertension", "heart_disease",
+                     "ever_married", "work_type", "Residence_type", "smoking_status")
+
+# Conversión de la variable 'stroke' a numérica
+stroke_data1$stroke <- as.numeric(as.character(stroke_data1$stroke))
+
+# Correlación de variables numéricas con 'stroke'
+
+num_corr_df <- sapply(numeric_vars, function(x) {
+  cor(stroke_data1[[x]], stroke_data1$stroke, use = "complete.obs")
+}) %>%
+  data.frame(variable = numeric_vars,
+             type = "numeric",
+             correlation_with_stroke = .,
+             stringsAsFactors = FALSE)
+
+# Cramér's V de variables categóricas con 'stroke'
+
+cramer_list <- lapply(categorical_vars, function(var){
+  tbl <- table(stroke_data1[[var]], stroke_data1$stroke)
+  data.frame(variable = var,
+             type = "categorical",
+             correlation_with_stroke = assocstats(tbl)$cramer,
+             stringsAsFactors = FALSE)
+})
+
+cramer_df <- bind_rows(cramer_list)
+
+# Combinar y ordenar
+
+summary_df <- bind_rows(num_corr_df, cramer_df) %>%
+  arrange(desc(correlation_with_stroke))
+
+# 6) Mostrar tabla final
+
+print(summary_df, row.names = FALSE)
+
+```
+# Tarea dos: Desarrollo de modelos de predicción
+
+```{r}
+
+# 1️⃣ Partición inicial de los datos (entrenamiento/prueba)
+
+# Asegurarse de que la variable objetivo 'stroke' sea un factor
+stroke_data1$stroke <- factor(stroke_data1$stroke)
+
+# Reordenar los niveles del factor para que '1' sea el primer nivel
+# Esto le dice a tidymodels que la clase positiva es '1'
+
+stroke_data1$stroke <- forcats::fct_relevel(stroke_data1$stroke, "1")
+
+# Fijar una semilla para la reproducibilidad de la partición
+set.seed(123)
+
+# Particionar los datos
+split <- initial_split(stroke_data1, prop = 0.8, strata = stroke)
+train_data <- training(split)
+test_data  <- testing(split)
+
+# 2️⃣ Receta de preprocesamiento
+
+# Definir la receta con los pasos de preprocesamiento
+rec <- recipe(stroke ~ ., data = train_data) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_smote(stroke, over_ratio = 1, neighbors = 3)
+
+# 3️⃣ Definición de los modelos
+
+mod_log <- logistic_reg() %>% set_engine("glm")
+mod_rf <- rand_forest() %>% 
+  set_engine("randomForest") %>%
+  set_mode("classification")
+mod_xgb <- boost_tree() %>% 
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# 4️⃣ Creación de los workflows
+
+wf_log <- workflow() %>% add_recipe(rec) %>% add_model(mod_log)
+wf_rf <- workflow() %>% add_recipe(rec) %>% add_model(mod_rf)
+wf_xgb <- workflow() %>% add_recipe(rec) %>% add_model(mod_xgb)
+
+# 5️⃣ Configuración de validación cruzada
+
+set.seed(123)
+data_folds <- vfold_cv(train_data, v = 5, strata = stroke)
+
+# 6️⃣ Entrenamiento y evaluación de cada modelo
+
+# Entrenar y recopilar métricas para Regresión Logística
+res_log <- fit_resamples(
+  wf_log,
+  resamples = data_folds,
+  metrics = metric_set(accuracy, roc_auc, f_meas)
+) %>%
+  collect_metrics() %>%
+  mutate(modelo = "Regresion Logistica")
+
+# Entrenar y recopilar métricas para Random Forest
+res_rf <- fit_resamples(
+  wf_rf,
+  resamples = data_folds,
+  metrics = metric_set(accuracy, roc_auc, f_meas)
+) %>%
+  collect_metrics() %>%
+  mutate(modelo = "Random Forest")
+
+# Entrenar y recopilar métricas para XGBoost
+res_xgb <- fit_resamples(
+  wf_xgb,
+  resamples = data_folds,
+  metrics = metric_set(accuracy, roc_auc, f_meas)
+) %>%
+  collect_metrics() %>%
+  mutate(modelo = "XGBoost")
+
+# 7️⃣ Combinar y comparar los resultados
+
+# res_log, res_rf y res_xgb
+resultados_finales <- bind_rows(res_log, res_rf, res_xgb)
+
+# Agrupar por modelo y métrica, y calcular el promedio usando la columna 'mean'
+resultados_promedio <- resultados_finales %>%
+  group_by(modelo, .metric) %>%
+  summarise(mean_estimate = mean(mean), .groups = "drop") %>%
+  pivot_wider(names_from = .metric, values_from = mean_estimate)
+
+# Imprimir la tabla de resultados promedio
+print(resultados_promedio)
+
+```
+
+
+# Tarea tres: Evaluación y selección de modelos de predicción
+
+```{r}
+# Gráfico de barras para comparar métricas clave (optimizado)
+resultados_promedio %>%
+  pivot_longer(cols = c(accuracy, f_meas, roc_auc), names_to = "metrica", values_to = "valor") %>%
+  ggplot(aes(x = modelo, y = valor, fill = metrica)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_text(aes(label = round(valor, 3)), vjust = -0.5, position = position_dodge(0.8), size = 3) +
+  facet_wrap(~ metrica, scales = "free_y") +
+  labs(title = "Comparación del rendimiento del modelo",
+       subtitle = "Métricas de validación cruzada (promedio)",
+       x = "Modelo",
+       y = "Valor de la Métrica") +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    strip.text = element_blank() 
+  )
+
+# Gráfico de Curva ROC para el modelo seleccionado: XGBoost 
+# Primero, finalizamos el modelo de XGBoost
+
+final_fit_xgb <- wf_xgb %>%
+  fit(data = train_data)
+
+# Luego, hacemos las predicciones en el conjunto de prueba
+preds_prob_xgb <- predict(final_fit_xgb, new_data = test_data, type = "prob")
+results_test <- test_data %>%
+  select(stroke) %>%
+  bind_cols(preds_prob_xgb)
+
+# Finalmente, generamos la curva ROC
+roc_curve(results_test, truth = stroke, .pred_1) %>%
+  autoplot() +
+  labs(title = "Curva ROC Final para el Modelo XGBoost",
+       subtitle = paste("AUC:", round(roc_auc(results_test, truth = stroke, .pred_1)$.estimate, 3))) +
+  theme_minimal()
+```
+
+# Tarea cuatro: Desplegar el modelo de predicción
+
+```{r}
+
+# **IMPORTANTE:** Este código asume que ya has corrido el script que entrena
+# y guarda el modelo final en un archivo llamado "modelo_prediccion_stroke.rds".
+
+# Este archivo debe estar en la misma carpeta que tu aplicación Shiny.
+loaded_model <- readRDS("modelo_prediccion_stroke.rds")
+
+# Definir la interfaz de usuario (UI)
+ui <- fluidPage(
+    titlePanel("Predicción de Riesgo de Accidente Cerebrovascular"),
+    sidebarLayout(
+        sidebarPanel(
+            h3("Datos del Paciente"),
+            # Incluir el ID para la identificación en la UI
+            numericInput("id", "ID del paciente:", value = 1),
+            selectInput("gender", "Género:",
+                        choices = c("Male", "Female", "Other")),
+            numericInput("age", "Edad:", value = 50, min = 0, max = 120),
+            selectInput("hypertension", "Hipertensión:",
+                        choices = c("No" = 0, "Yes" = 1)),
+            selectInput("heart_disease", "Enfermedad del corazón:",
+                        choices = c("No" = 0, "Yes" = 1)),
+            selectInput("ever_married", "Casado(a):",
+                        choices = c("Yes", "No")),
+            selectInput("work_type", "Tipo de trabajo:",
+                        choices = c("Private", "Self-employed", "Govt_job", "children", "Never_worked")),
+            selectInput("Residence_type", "Tipo de residencia:",
+                        choices = c("Urban", "Rural")),
+            numericInput("avg_glucose_level", "Nivel de glucosa:", value = 100),
+            numericInput("bmi", "IMC:", value = 25, min = 10, max = 80),
+            selectInput("smoking_status", "Estado de fumador:",
+                        choices = c("formerly smoked", "never smoked", "smokes", "Unknown")),
+            
+            actionButton("predictButton", "Calcular Riesgo")
+        ),
+        mainPanel(
+            h3("Resultado de la Predicción"),
+            # Aquí se mostrará el resultado
+            textOutput("prediction_result")
+        )
+    )
+)
+
+# Definir la lógica del servidor (Server)
+server <- function(input, output, session) {
+    # Observar el evento de clic en el botón de predicción
+    observeEvent(input$predictButton, {
+        
+        # Recopilar los datos del usuario en un data frame
+       
+        new_data <- tibble(
+            id = input$id,
+            gender = input$gender,
+            age = input$age,
+            hypertension = as.integer(input$hypertension),
+            heart_disease = as.integer(input$heart_disease),
+            ever_married = input$ever_married,
+            work_type = input$work_type,
+            Residence_type = input$Residence_type,
+            avg_glucose_level = input$avg_glucose_level,
+            bmi = input$bmi,
+            smoking_status = input$smoking_status
+        )
+        
+        # Realizar la predicción usando el modelo cargado
+       
+        prediction <- predict(loaded_model, new_data = new_data, type = "prob")
+        
+        # Mostrar el resultado en la interfaz, incluyendo el ID para referencia
+        output$prediction_result <- renderText({
+            prob_stroke <- round(prediction$.pred_1, 4) * 100
+            paste0("Predicción para el paciente con ID ", input$id, ": La probabilidad de un accidente cerebrovascular es de: ", prob_stroke, "%")
+        })
+    })
+}
+
+# Ejecutar la aplicación
+shinyApp(ui = ui, server = server)
+```
+
+# Tarea cinco: Hallazgos y conclusiones
+
+Manejo del desequilibrio de clases: Se detectó un desequilibrio entre pacientes con y sin accidente cerebrovascular, abordado con SMOTE (over_ratio = 1, neighbors = 3) para mejorar la detección de la clase minoritaria.
+
+Imputación de datos faltantes: La variable bmi se imputó con la mediana. Esta estrategia estándar podría afectar el rendimiento, y en el futuro se podrían evaluar métodos más sofisticados.
+
+Importancia de las variables predictivas: La edad es la variable más influyente, seguida de enfermedades del corazón, glucosa e hipertensión, mientras que género y tipo de residencia aportan poco a la predicción.
+
+Selección del modelo: Se eligió XGBoost por su equilibrio entre accuracy, F-measure y ROC AUC. Random Forest y regresión logística presentan ventajas y desventajas en diferentes métricas, pero XGBoost ofrece el mejor desempeño global.
+
+Conclusión y recomendaciones: El modelo es prometedor para predecir accidentes cerebrovasculares. Se sugiere explorar nuevas variables y estrategias de ingeniería de características para mejorar su capacidad predictiva y relevancia clínica.
+
+ 
+ 
+
