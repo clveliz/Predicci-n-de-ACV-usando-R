@@ -1,4 +1,4 @@
-# Predicción de ACV con R
+# Predicción del riesgo de ACV con Machine Learning en R
 
 Repositorio con un script en R para predecir el riesgo de accidente cerebrovascular (ACV) mediante análisis de datos y entrenamiento de un modelo de machine learning.
 
